@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import edge_tts
 import feedparser
+import trafilatura
 from google import genai
 
 # ---------- IMPOSTAZIONI (modificabili) ----------
@@ -22,9 +23,14 @@ FEEDS = [
     "https://www.ilpost.it/italia/feed/",
     "https://www.ilpost.it/mondo/feed/",
 ]
-MAX_ARTICOLI = 18
+MAX_ARTICOLI = 30          # notizie totali date a Gemini
+APPROFONDIMENTI = 8        # di quante scarico il testo completo (candidate agli approfondimenti)
+MAX_CARATTERI_ARTICOLO = 3500
+
 VOCE = "it-IT-IsabellaNeural"  # alternativa maschile: it-IT-DiegoNeural
 VELOCITA = "+5%"
+PAROLE_TARGET = 2200       # circa 14 minuti di audio (circa 155 parole al minuto)
+
 # Prova i modelli in ordine e usa il primo che funziona
 MODELLI = [
     "gemini-3.8-flash",
@@ -33,7 +39,6 @@ MODELLI = [
     "gemini-3.7-flash",
 ]
 TENTATIVI = 3  # per ogni modello, con pausa crescente se Google è sovraccarico
-PAROLE_TARGET = 1100  # circa 7-8 minuti di audio
 
 GIORNI = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"]
 MESI = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio",
@@ -46,9 +51,24 @@ def pulisci(testo):
     return re.sub(r"\s+", " ", html.unescape(testo)).strip()
 
 
+def scarica_articolo(link):
+    """Prova a leggere il testo completo dell'articolo. Se non riesce, restituisce ''."""
+    if not link:
+        return ""
+    try:
+        pagina = trafilatura.fetch_url(link)
+        testo = trafilatura.extract(pagina) if pagina else ""
+    except Exception as e:
+        print(f"Articolo non scaricabile {link}: {e}")
+        return ""
+    testo = pulisci(testo or "")
+    # sotto i 400 caratteri di solito è un estratto o una pagina riservata agli abbonati
+    return testo[:MAX_CARATTERI_ARTICOLO] if len(testo) > 400 else ""
+
+
 def prendi_notizie():
     viste = set()
-    righe = []
+    blocchi = []
     for url in FEEDS:
         try:
             feed = feedparser.parse(url)
@@ -61,29 +81,44 @@ def prendi_notizie():
                 continue
             viste.add(titolo)
             riassunto = pulisci(voce.get("summary"))[:500]
-            righe.append(f"- {titolo}. {riassunto}")
-            if len(righe) >= MAX_ARTICOLI:
+            completo = ""
+            if len(blocchi) < APPROFONDIMENTI:
+                completo = scarica_articolo(voce.get("link"))
+            if completo:
+                blocchi.append(f"- {titolo}.\n  TESTO COMPLETO: {completo}")
+            else:
+                blocchi.append(f"- {titolo}. {riassunto}")
+            if len(blocchi) >= MAX_ARTICOLI:
                 break
-        if len(righe) >= MAX_ARTICOLI:
+        if len(blocchi) >= MAX_ARTICOLI:
             break
-    if not righe:
+    if not blocchi:
         raise SystemExit("Nessuna notizia trovata nei feed.")
-    return "\n".join(righe)
+    completi = sum(1 for b in blocchi if "TESTO COMPLETO" in b)
+    print(f"Notizie raccolte: {len(blocchi)} (con testo completo: {completi})")
+    return "\n".join(blocchi)
 
 
 def scrivi_testo(notizie, data_parlata):
     prompt = (
         f"Sei il conduttore di un notiziario radiofonico mattutino in italiano. "
-        f"Oggi è {data_parlata}. Qui sotto trovi i titoli e gli estratti delle notizie "
-        f"del giorno da Il Post.\n\n"
-        f"Scrivi il testo parlato di una rassegna di circa {PAROLE_TARGET} parole, "
-        f"da ascoltare in metro.\n"
+        f"Oggi è {data_parlata}. Qui sotto trovi le notizie del giorno da Il Post: "
+        f"alcune con TESTO COMPLETO, altre solo con titolo ed estratto.\n\n"
+        f"Scrivi il testo parlato di una puntata di circa {PAROLE_TARGET} parole "
+        f"(non meno di {int(PAROLE_TARGET * 0.85)}), da ascoltare in metro, "
+        f"circa 14 minuti di lettura.\n"
+        f"Struttura:\n"
+        f"1. Saluto breve con la data e una panoramica di 3-4 titoli del giorno.\n"
+        f"2. Approfondimenti: scegli le 5 o 6 notizie più importanti tra quelle con "
+        f"TESTO COMPLETO e raccontale in modo disteso, circa 250-300 parole ciascuna: "
+        f"cosa è successo, contesto, protagonisti, perché conta.\n"
+        f"3. In breve: tutte le altre notizie, 2 o 3 frasi ciascuna, raggruppate per tema "
+        f"(Italia, mondo, economia, cultura...).\n"
+        f"4. Congedo breve.\n\n"
         f"Regole:\n"
-        f"- Apri con un saluto breve e la data, chiudi con una frase di congedo.\n"
-        f"- Raggruppa le notizie per tema (Italia, mondo, economia, cultura...) "
-        f"e dai più spazio alle più importanti.\n"
-        f"- Tono chiaro, scorrevole, naturale, come una radio di qualità.\n"
-        f"- Usa solo le informazioni fornite, non inventare dettagli o numeri.\n"
+        f"- Tono chiaro, scorrevole, naturale, come una radio di qualità; usa frasi "
+        f"di transizione tra una notizia e l'altra.\n"
+        f"- Usa solo le informazioni fornite, non inventare dettagli, citazioni o numeri.\n"
         f"- Solo testo da leggere ad alta voce: niente elenchi, titoli, markdown, "
         f"emoji, parentesi o URL.\n"
         f"- Scrivi per esteso numeri, sigle e simboli difficili da pronunciare.\n\n"
@@ -108,7 +143,7 @@ def scrivi_testo(notizie, data_parlata):
         if testo:
             break
     if len(testo) < 500:
-        raise SystemExit("Il testo generato è troppo corto, interrompo.")
+        raise SystemExit("Il testo generato è troppo corto o assente, interrompo.")
     return testo
 
 
@@ -167,7 +202,10 @@ def main():
 
     notizie = prendi_notizie()
     testo = scrivi_testo(notizie, data_parlata)
-    print(f"Testo generato: {len(testo.split())} parole")
+    parole = len(testo.split())
+    print(f"Testo generato: {parole} parole (circa {parole / 155:.1f} minuti)")
+    if parole < PAROLE_TARGET * 0.6:
+        print("Attenzione: testo più corto del previsto.")
 
     cartella = "site"
     os.makedirs(cartella, exist_ok=True)
