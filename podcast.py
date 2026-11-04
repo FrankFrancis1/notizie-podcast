@@ -2,6 +2,7 @@ import asyncio
 import html
 import os
 import re
+import shutil
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -246,6 +247,8 @@ def sintetizza(client, modello, testo):
 
 def audio_gemini(testo, percorso_mp3):
     """Voce Gemini. Solleva un errore se qualcosa non va, così si passa a Isabella."""
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("ffmpeg non installato")
     client = genai.Client()
     pezzi = dividi_testo(testo, MAX_CARATTERI_TTS)
     print(f"Voce Gemini: {len(pezzi)} pezzi di testo")
