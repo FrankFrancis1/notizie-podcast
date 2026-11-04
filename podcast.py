@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from email.utils import formatdate
@@ -62,6 +63,10 @@ MODELLI = [
     "gemini-3.7-flash",
 ]
 TENTATIVI = 3  # per ogni modello, con pausa crescente se Google è sovraccarico
+
+# Archivio e copertina
+GIORNI_ARCHIVIO = 7  # quanti episodi restano disponibili nel feed
+COPERTINE = ("cover.png", "cover.jpg", "cover.jpeg")  # file da mettere nella radice del repo
 
 GIORNI = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"]
 MESI = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio",
@@ -313,10 +318,67 @@ def crea_audio(testo, percorso):
     print("Audio creato con Isabella (Edge TTS)")
 
 
-# ---------- FEED ----------
+# ---------- FEED E ARCHIVIO ----------
 
-def scrivi_feed(cartella, nome_file, titolo, descrizione, adesso):
-    dimensione = os.path.getsize(os.path.join(cartella, nome_file))
+NOME_VALIDO = re.compile(r"^notizie-\d{4}-\d{2}-\d{2}\.mp3$")
+
+
+def recupera_archivio(cartella, nome_file_oggi):
+    """Scarica dal sito già pubblicato gli episodi dei giorni scorsi, così restano online."""
+    try:
+        feed = feedparser.parse(f"{BASE_URL}/feed.xml")
+    except Exception as e:
+        print(f"Archivio non leggibile: {e}")
+        return []
+    candidati = []
+    for voce in feed.entries:
+        if not voce.get("enclosures"):
+            continue
+        url = voce.enclosures[0].get("href", "")
+        nome = url.rsplit("/", 1)[-1]
+        if not NOME_VALIDO.match(nome) or nome == nome_file_oggi:
+            continue
+        candidati.append({
+            "titolo": voce.get("title", nome),
+            "descrizione": voce.get("summary", ""),
+            "data": voce.get("published", formatdate()),
+            "nome": nome,
+            "url": url,
+        })
+    candidati.sort(key=lambda e: e["nome"], reverse=True)  # il nome contiene la data
+    recuperati = []
+    for ep in candidati[:GIORNI_ARCHIVIO - 1]:
+        try:
+            with urllib.request.urlopen(ep["url"], timeout=120) as risposta:
+                with open(os.path.join(cartella, ep["nome"]), "wb") as f:
+                    shutil.copyfileobj(risposta, f)
+            recuperati.append(ep)
+        except Exception as e:
+            print(f"Episodio {ep['nome']} non recuperabile, lo salto: {e}")
+    print(f"Episodi recuperati dall'archivio: {len(recuperati)}")
+    return recuperati
+
+
+def scrivi_feed(cartella, episodi, copertina):
+    immagine = ""
+    if copertina:
+        url_img = f"{BASE_URL}/{copertina}"
+        immagine = (
+            f'    <itunes:image href="{url_img}"/>\n'
+            f"    <image><url>{url_img}</url><title>Notizie del mattino</title>"
+            f"<link>{BASE_URL}/</link></image>\n"
+        )
+    voci = ""
+    for ep in episodi:
+        dimensione = os.path.getsize(os.path.join(cartella, ep["nome"]))
+        voci += f"""    <item>
+      <title>{escape(ep["titolo"])}</title>
+      <description>{escape(ep["descrizione"])}</description>
+      <pubDate>{ep["data"]}</pubDate>
+      <guid isPermaLink="false">{escape(ep["nome"])}</guid>
+      <enclosure url="{BASE_URL}/{ep["nome"]}" length="{dimensione}" type="audio/mpeg"/>
+    </item>
+"""
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
   <channel>
@@ -326,30 +388,26 @@ def scrivi_feed(cartella, nome_file, titolo, descrizione, adesso):
     <description>Rassegna quotidiana delle notizie de Il Post, letta da una voce AI.</description>
     <itunes:author>Notizie del mattino</itunes:author>
     <itunes:explicit>false</itunes:explicit>
-    <item>
-      <title>{escape(titolo)}</title>
-      <description>{escape(descrizione)}</description>
-      <pubDate>{formatdate(adesso.timestamp())}</pubDate>
-      <guid isPermaLink="false">{escape(nome_file)}</guid>
-      <enclosure url="{BASE_URL}/{nome_file}" length="{dimensione}" type="audio/mpeg"/>
-    </item>
-  </channel>
+{immagine}{voci}  </channel>
 </rss>
 """
     with open(os.path.join(cartella, "feed.xml"), "w", encoding="utf-8") as f:
         f.write(xml)
 
 
-def scrivi_pagina(cartella, nome_file, titolo):
+def scrivi_pagina(cartella, episodi):
+    righe = "".join(
+        f'<h3>{escape(ep["titolo"])}</h3>\n'
+        f'<audio controls preload="none" src="{ep["nome"]}" style="width:100%"></audio>\n'
+        for ep in episodi
+    )
     pagina = f"""<!doctype html>
 <html lang="it"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Notizie del mattino</title></head>
 <body style="font-family:sans-serif;max-width:600px;margin:2rem auto;padding:0 1rem">
 <h1>Notizie del mattino</h1>
-<p>{escape(titolo)}</p>
-<audio controls src="{nome_file}" style="width:100%"></audio>
-<p>Feed podcast: <code>{BASE_URL}/feed.xml</code></p>
+{righe}<p>Feed podcast: <code>{BASE_URL}/feed.xml</code></p>
 </body></html>
 """
     with open(os.path.join(cartella, "index.html"), "w", encoding="utf-8") as f:
@@ -372,9 +430,26 @@ def main():
     os.makedirs(cartella, exist_ok=True)
     crea_audio(testo, os.path.join(cartella, nome_file))
 
-    scrivi_feed(cartella, nome_file, titolo, testo[:300] + "...", adesso)
-    scrivi_pagina(cartella, nome_file, titolo)
-    print("Fatto:", nome_file)
+    oggi = {
+        "titolo": titolo,
+        "descrizione": testo[:300] + "...",
+        "data": formatdate(adesso.timestamp(), usegmt=True),
+        "nome": nome_file,
+    }
+    episodi = [oggi] + recupera_archivio(cartella, nome_file)
+
+    copertina = None
+    for nome in COPERTINE:
+        if os.path.exists(nome):
+            shutil.copy(nome, os.path.join(cartella, nome))
+            copertina = nome
+            break
+    if not copertina:
+        print("Nessuna copertina trovata (cover.png o cover.jpg nella radice del repo).")
+
+    scrivi_feed(cartella, episodi, copertina)
+    scrivi_pagina(cartella, episodi)
+    print(f"Fatto: {nome_file} ({len(episodi)} episodi nel feed)")
 
 
 if __name__ == "__main__":
