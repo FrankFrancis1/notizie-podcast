@@ -2,6 +2,7 @@ import asyncio
 import html
 import os
 import re
+import time
 from datetime import datetime
 from email.utils import formatdate
 from xml.sax.saxutils import escape
@@ -25,7 +26,13 @@ MAX_ARTICOLI = 18
 VOCE = "it-IT-IsabellaNeural"  # alternativa maschile: it-IT-DiegoNeural
 VELOCITA = "+5%"
 # Prova i modelli in ordine e usa il primo che funziona
-MODELLI = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-2.5-flash"]
+MODELLI = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.7-flash",
+]
+TENTATIVI = 3  # per ogni modello, con pausa crescente se Google è sovraccarico
 PAROLE_TARGET = 1100  # circa 7-8 minuti di audio
 
 GIORNI = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"]
@@ -85,14 +92,21 @@ def scrivi_testo(notizie, data_parlata):
     client = genai.Client()  # legge la chiave da GEMINI_API_KEY
     testo = ""
     for modello in MODELLI:
-        try:
-            risposta = client.models.generate_content(model=modello, contents=prompt)
-            testo = (risposta.text or "").strip()
-            if testo:
-                print(f"Modello usato: {modello}")
-                break
-        except Exception as e:
-            print(f"Modello {modello} non disponibile: {e}")
+        for tentativo in range(1, TENTATIVI + 1):
+            try:
+                risposta = client.models.generate_content(model=modello, contents=prompt)
+                testo = (risposta.text or "").strip()
+                if testo:
+                    print(f"Modello usato: {modello} (tentativo {tentativo})")
+                    break
+            except Exception as e:
+                print(f"{modello}, tentativo {tentativo}/{TENTATIVI} fallito: {e}")
+                if "404" in str(e):
+                    break  # modello inesistente, inutile riprovare
+                if tentativo < TENTATIVI:
+                    time.sleep(30 * tentativo)
+        if testo:
+            break
     if len(testo) < 500:
         raise SystemExit("Il testo generato è troppo corto, interrompo.")
     return testo
