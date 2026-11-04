@@ -30,8 +30,13 @@ jobs:
       - name: Installa dipendenze
         run: pip install -U feedparser edge-tts google-genai trafilatura
 
-      - name: Verifica ffmpeg
-        run: ffmpeg -version | head -n 1 || sudo apt-get install -y ffmpeg
+      - name: Installa ffmpeg
+        run: |
+          if ! command -v ffmpeg > /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version | head -n 1
 
       - name: Genera il podcast
         run: python podcast.py
