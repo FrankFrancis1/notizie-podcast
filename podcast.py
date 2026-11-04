@@ -48,7 +48,7 @@ MODELLI_TTS = [
     "gemini-2.5-flash-preview-tts",
 ]
 ISTRUZIONE_VOCE = "Leggi ad alta voce in italiano, con tono da conduttore radiofonico, caldo e chiaro:"
-MAX_CARATTERI_TTS = 3500     # dimensione di ogni pezzo inviato alla voce
+MAX_CARATTERI_TTS = 5000     # dimensione di ogni pezzo inviato alla voce (meno pezzi = meno richieste)
 TENTATIVI_TTS = 3
 
 VOCE_EDGE = "it-IT-IsabellaNeural"  # voce di riserva; maschile: it-IT-DiegoNeural
@@ -253,28 +253,31 @@ def audio_gemini(testo, percorso_mp3):
     pezzi = dividi_testo(testo, MAX_CARATTERI_TTS)
     print(f"Voce Gemini: {len(pezzi)} pezzi di testo")
     pcm = bytearray()
-    modello_ok = None
+    modelli_ok = list(MODELLI_TTS)  # modelli ancora utilizzabili, il primo è quello in uso
     for numero, pezzo in enumerate(pezzi, 1):
-        candidati = [modello_ok] if modello_ok else MODELLI_TTS
         dati = None
-        for modello in candidati:
+        modello = None
+        while modelli_ok and not dati:
+            modello = modelli_ok[0]
             for tentativo in range(1, TENTATIVI_TTS + 1):
                 try:
                     dati = sintetizza(client, modello, pezzo)
-                    modello_ok = modello
                     break
                 except Exception as e:
-                    print(f"TTS {modello}, pezzo {numero}, tentativo {tentativo}: {e}")
-                    if "404" in str(e):
+                    messaggio = str(e)
+                    print(f"TTS {modello}, pezzo {numero}, tentativo {tentativo}: {messaggio[:300]}")
+                    # modello inesistente o quota giornaliera finita: inutile riprovare
+                    if "404" in messaggio or "PerDay" in messaggio:
                         break
                     if tentativo < TENTATIVI_TTS:
                         time.sleep(30 * tentativo)
-            if dati:
-                break
+            if not dati:
+                print(f"Escludo {modello} per questa puntata")
+                modelli_ok.pop(0)
         if not dati:
             raise RuntimeError(f"Voce Gemini non riuscita al pezzo {numero}")
         pcm.extend(dati)
-        print(f"Pezzo {numero}/{len(pezzi)} ok ({modello_ok})")
+        print(f"Pezzo {numero}/{len(pezzi)} ok ({modello})")
 
     # l'audio Gemini è PCM grezzo a 24 kHz, 16 bit, mono: lo converto in mp3
     percorso_pcm = percorso_mp3 + ".pcm"
