@@ -28,7 +28,7 @@ jobs:
           python-version: "3.12"
 
       - name: Installa dipendenze
-        run: pip install -U feedparser edge-tts google-genai
+        run: pip install -U feedparser edge-tts google-genai trafilatura
 
       - name: Genera il podcast
         run: python podcast.py
