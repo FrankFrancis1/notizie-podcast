@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 import edge_tts
 import feedparser
-from anthropic import Anthropic
+from google import genai
 
 # ---------- IMPOSTAZIONI (modificabili) ----------
 USER = "FrankFrancis1"
@@ -24,7 +24,8 @@ FEEDS = [
 MAX_ARTICOLI = 18
 VOCE = "it-IT-IsabellaNeural"  # alternativa maschile: it-IT-DiegoNeural
 VELOCITA = "+5%"
-MODELLO = "claude-sonnet-5-5"
+# Prova i modelli in ordine e usa il primo che funziona
+MODELLI = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-2.5-flash"]
 PAROLE_TARGET = 1100  # circa 7-8 minuti di audio
 
 GIORNI = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"]
@@ -81,13 +82,17 @@ def scrivi_testo(notizie, data_parlata):
         f"- Scrivi per esteso numeri, sigle e simboli difficili da pronunciare.\n\n"
         f"NOTIZIE:\n{notizie}"
     )
-    client = Anthropic()
-    risposta = client.messages.create(
-        model=MODELLO,
-        max_tokens=3000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    testo = risposta.content[0].text.strip()
+    client = genai.Client()  # legge la chiave da GEMINI_API_KEY
+    testo = ""
+    for modello in MODELLI:
+        try:
+            risposta = client.models.generate_content(model=modello, contents=prompt)
+            testo = (risposta.text or "").strip()
+            if testo:
+                print(f"Modello usato: {modello}")
+                break
+        except Exception as e:
+            print(f"Modello {modello} non disponibile: {e}")
     if len(testo) < 500:
         raise SystemExit("Il testo generato è troppo corto, interrompo.")
     return testo
@@ -161,4 +166,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-  
