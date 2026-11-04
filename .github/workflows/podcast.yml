@@ -28,12 +28,12 @@ jobs:
           python-version: "3.12"
 
       - name: Installa dipendenze
-        run: pip install -U feedparser edge-tts anthropic
+        run: pip install -U feedparser edge-tts google-genai
 
       - name: Genera il podcast
         run: python podcast.py
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
       - uses: actions/configure-pages@v5
 
