@@ -2,7 +2,7 @@ name: Podcast mattutino
 
 on:
   schedule:
-    - cron: "30 4 * * *"   # 04:30 UTC = 05:30 inverno / 06:30 estate in Italia
+    - cron: "0 20 * * *"   # 20:00 UTC = 21:00 inverno / 22:00 estate in Italia
   workflow_dispatch:        # permette di avviarlo a mano
 
 permissions:
