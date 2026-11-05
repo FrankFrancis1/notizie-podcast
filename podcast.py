@@ -7,7 +7,7 @@ import subprocess
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email.utils import formatdate
 from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo
@@ -29,6 +29,11 @@ FEEDS = [
     "https://www.ilpost.it/mondo/feed/",
 ]
 
+# Quali notizie
+POOL_MAX = 60        # notizie del giorno tra cui scegliere le più importanti
+MIN_NOTIZIE = 10     # se oggi ce ne sono meno, aggiungo quelle del giorno prima
+MAX_PAGINE_FEED = 4  # quante pagine di ogni feed leggere per risalire fino a inizio giornata
+
 # Struttura della puntata
 N_APPROFONDIMENTI = 8        # notizie raccontate in modo disteso
 PAROLE_APPROFONDIMENTO = 200  # parole minime per ciascuna
@@ -42,13 +47,14 @@ MAX_CARATTERI_BREVI = 1800   # idem per le notizie brevi
 
 # Voce
 USA_GEMINI_TTS = True        # se False usa sempre Isabella
-VOCE_GEMINI = "Kore"         # altre: Zephyr, Puck, Charon, Fenrir, Leda, Orus, Aoede
+VOCE_GEMINI = "Aoede"         # altre: Zephyr, Puck, Charon, Fenrir, Leda, Orus, Kore
 MODELLI_TTS = [
     "gemini-3.8-flash-tts",
     "gemini-3.8-flash-lite-tts",
     "gemini-2.5-flash-preview-tts",
 ]
-ISTRUZIONE_VOCE = "Leggi ad alta voce in italiano, con tono da conduttore radiofonico, caldo e chiaro:"
+# Lasciare vuoto: i modelli vocali leggono ad alta voce anche le istruzioni scritte nel testo.
+ISTRUZIONE_VOCE = ""
 MAX_CARATTERI_TTS = 5000     # dimensione di ogni pezzo inviato alla voce (meno pezzi = meno richieste)
 TENTATIVI_TTS = 3
 
@@ -94,40 +100,113 @@ def scarica_articolo(link):
     return testo if len(testo) > 400 else ""
 
 
-def prendi_notizie():
-    totale = N_APPROFONDIMENTI + N_BREVI
-    viste = set()
-    notizie = []
-    for url in FEEDS:
+def data_voce(voce, fuso):
+    """Data (fuso italiano) di pubblicazione di un articolo, o None se non è indicata."""
+    t = voce.get("published_parsed") or voce.get("updated_parsed")
+    if not t:
+        return None
+    return datetime(*t[:6], tzinfo=timezone.utc).astimezone(fuso).date()
+
+
+def leggi_feed(url, giorno_minimo, fuso):
+    """Legge un feed pagina per pagina, finché arriva a notizie più vecchie di giorno_minimo."""
+    voci, link_visti = [], set()
+    for pagina in range(1, MAX_PAGINE_FEED + 1):
+        indirizzo = url if pagina == 1 else f"{url}?paged={pagina}"
         try:
-            feed = feedparser.parse(url)
+            feed = feedparser.parse(indirizzo)
         except Exception as e:
-            print(f"Feed non leggibile {url}: {e}")
-            continue
-        for voce in feed.entries:
+            print(f"Feed non leggibile {indirizzo}: {e}")
+            break
+        nuove = [v for v in feed.entries if v.get("link") and v.get("link") not in link_visti]
+        if not nuove:
+            break  # pagina vuota, oppure il sito ignora la paginazione
+        for v in nuove:
+            link_visti.add(v.get("link"))
+            voci.append(v)
+        date = [data_voce(v, fuso) for v in nuove]
+        date = [d for d in date if d]
+        if date and min(date) < giorno_minimo:
+            break  # siamo già arrivati a notizie dei giorni scorsi
+    return voci
+
+
+def raccogli_pool(giorno, fuso):
+    """Notizie pubblicate nel giorno indicato (e, se sono poche, anche il giorno prima)."""
+    ieri = giorno - timedelta(days=1)
+    viste = set()
+    di_oggi, di_ieri = [], []
+    for url in FEEDS:
+        for voce in leggi_feed(url, ieri, fuso):
             titolo = pulisci(voce.get("title"))
             if not titolo or titolo in viste:
                 continue
-            viste.add(titolo)
-            notizie.append({
+            d = data_voce(voce, fuso)
+            elemento = {
                 "titolo": titolo,
                 "riassunto": pulisci(voce.get("summary"))[:600],
                 "link": voce.get("link"),
-            })
-            if len(notizie) >= totale:
-                break
-        if len(notizie) >= totale:
-            break
-    if not notizie:
+            }
+            if d == giorno:
+                viste.add(titolo)
+                di_oggi.append(elemento)
+            elif d == ieri:
+                viste.add(titolo)
+                di_ieri.append(elemento)
+    print(f"Notizie pubblicate oggi: {len(di_oggi)}; ieri: {len(di_ieri)}")
+    pool = di_oggi
+    if len(pool) < MIN_NOTIZIE:
+        print("Poche notizie di oggi: aggiungo quelle del giorno prima.")
+        pool = di_oggi + di_ieri
+    if not pool:
         raise SystemExit("Nessuna notizia trovata nei feed.")
+    return pool[:POOL_MAX]
 
-    # scarico in parallelo il testo completo di tutte le notizie
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        testi = list(pool.map(lambda n: scarica_articolo(n["link"]), notizie))
+
+def scegli_importanti(client, pool, quante):
+    """Chiede a Gemini quali notizie del pool sono le più rilevanti. In caso di problemi, ordine del feed."""
+    if len(pool) <= quante:
+        return pool
+    elenco = "\n".join(f"{i}. {n['titolo']} - {n['riassunto'][:200]}" for i, n in enumerate(pool))
+    prompt = (
+        f"Qui sotto trovi le notizie pubblicate oggi da Il Post, numerate. "
+        f"Scegli le {quante} più rilevanti per una rassegna serale: dai priorità a fatti "
+        f"importanti e di interesse generale, e mantieni un buon equilibrio tra Italia, "
+        f"mondo, economia e cultura; evita doppioni sullo stesso argomento. "
+        f"Rispondi SOLO con i numeri scelti, separati da virgole, dal più importante "
+        f"al meno importante.\n\n{elenco}"
+    )
+    risposta = chiedi_gemini(client, prompt)
+    numeri = []
+    for n in re.findall(r"\d+", risposta):
+        i = int(n)
+        if 0 <= i < len(pool) and i not in numeri:
+            numeri.append(i)
+    if len(numeri) < quante // 2:
+        print("Selezione per importanza non utilizzabile: uso l'ordine del feed.")
+        return pool[:quante]
+    scelte = [pool[i] for i in numeri[:quante]]
+    # se la selezione è più corta del previsto, completo con le altre notizie
+    for i, n in enumerate(pool):
+        if len(scelte) >= quante:
+            break
+        if i not in numeri:
+            scelte.append(n)
+    return scelte
+
+
+def prendi_notizie(client, giorno, fuso):
+    totale = N_APPROFONDIMENTI + N_BREVI
+    pool = raccogli_pool(giorno, fuso)
+    notizie = scegli_importanti(client, pool, totale)
+
+    # scarico in parallelo il testo completo di tutte le notizie scelte
+    with ThreadPoolExecutor(max_workers=8) as pool_thread:
+        testi = list(pool_thread.map(lambda n: scarica_articolo(n["link"]), notizie))
     for notizia, testo in zip(notizie, testi):
         notizia["completo"] = testo
     completi = sum(1 for n in notizie if n["completo"])
-    print(f"Notizie raccolte: {len(notizie)} (con testo completo: {completi})")
+    print(f"Notizie scelte: {len(notizie)} (con testo completo: {completi})")
     return notizie
 
 
@@ -170,15 +249,17 @@ REGOLE_COMUNI = (
 )
 
 
-def scrivi_testo(notizie, data_parlata):
-    client = genai.Client()  # legge la chiave da GEMINI_API_KEY
+def scrivi_testo(client, notizie, data_parlata):
     approfondimenti = notizie[:N_APPROFONDIMENTI]
     brevi = notizie[N_APPROFONDIMENTI:]
 
     prompt_a = (
-        f"Sei il conduttore di un notiziario radiofonico mattutino in italiano. "
-        f"Oggi è {data_parlata}. Stai scrivendo la PRIMA PARTE della puntata.\n\n"
-        f"Scrivi: un saluto breve con la data e una panoramica dei titoli del giorno "
+        f"Sei il conduttore di un notiziario radiofonico in italiano. La puntata viene "
+        f"preparata la sera e ascoltata la mattina dopo. Racconta le notizie di {data_parlata}: "
+        f"non dire mai \"oggi\", \"stamattina\", \"ieri\" o \"stasera\", ma riferisciti al giorno "
+        f"per nome o alla data. Stai scrivendo la PRIMA PARTE della puntata.\n\n"
+        f"Scrivi: un saluto breve (per esempio \"Buongiorno\") con la data della rassegna e "
+        f"una panoramica dei titoli del giorno "
         f"(3 o 4 frasi); poi un approfondimento per OGNUNA delle {len(approfondimenti)} "
         f"notizie qui sotto, nell'ordine dato. Ogni approfondimento deve essere un "
         f"racconto disteso di almeno {PAROLE_APPROFONDIMENTO} parole: cosa è successo, "
@@ -194,9 +275,10 @@ def scrivi_testo(notizie, data_parlata):
     parte_b = ""
     if brevi:
         prompt_b = (
-            f"Sei il conduttore di un notiziario radiofonico mattutino in italiano. "
-            f"Oggi è {data_parlata}. Stai scrivendo la SECONDA E ULTIMA PARTE della puntata, "
-            f"che comincia dopo gli approfondimenti.\n\n"
+            f"Sei il conduttore di un notiziario radiofonico in italiano. La puntata viene "
+            f"ascoltata la mattina dopo e racconta le notizie di {data_parlata}: non dire mai "
+            f"\"oggi\", \"stamattina\", \"ieri\" o \"stasera\". Stai scrivendo la SECONDA E "
+            f"ULTIMA PARTE della puntata, che comincia dopo gli approfondimenti.\n\n"
             f"Apri con una breve frase di passaggio (per esempio che passiamo alle altre "
             f"notizie del giorno), senza salutare di nuovo. Poi la rassegna \"in breve\": "
             f"per OGNUNA delle {len(brevi)} notizie qui sotto scrivi un paragrafo di almeno "
@@ -210,7 +292,7 @@ def scrivi_testo(notizie, data_parlata):
         print(f"Seconda parte: {len(parte_b.split())} parole")
     if len(parte_b) < 300:
         print("Seconda parte non disponibile, chiudo la puntata con un congedo.")
-        parte_b = "Per oggi è tutto. Buona giornata, e al prossimo notiziario."
+        parte_b = "Per questa rassegna è tutto. Buona giornata, e al prossimo notiziario."
 
     return f"{parte_a}\n\n{parte_b}"
 
@@ -234,7 +316,7 @@ def dividi_testo(testo, massimo):
 def sintetizza(client, modello, testo):
     risposta = client.models.generate_content(
         model=modello,
-        contents=f"{ISTRUZIONE_VOCE}\n\n{testo}",
+        contents=f"{ISTRUZIONE_VOCE}\n\n{testo}" if ISTRUZIONE_VOCE else testo,
         config=types.GenerateContentConfig(
             response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
@@ -421,8 +503,9 @@ def main():
     nome_file = f"notizie-{sigla_data}.mp3"
     titolo = f"Notizie di {data_parlata}"
 
-    notizie = prendi_notizie()
-    testo = scrivi_testo(notizie, data_parlata)
+    client = genai.Client()  # legge la chiave da GEMINI_API_KEY
+    notizie = prendi_notizie(client, adesso.date(), adesso.tzinfo)
+    testo = scrivi_testo(client, notizie, data_parlata)
     parole = len(testo.split())
     print(f"Testo totale: {parole} parole (circa {parole / 155:.1f} minuti)")
 
