@@ -27,7 +27,13 @@ FEEDS = [
     "https://www.ilpost.it/feed/",
     "https://www.ilpost.it/italia/feed/",
     "https://www.ilpost.it/mondo/feed/",
-]
+    "https://www.ilpost.it/politica/feed/",
+    "https://www.ilpost.it/economia/feed/",
+    "https://www.ilpost.it/cultura/feed/",
+    "https://www.ilpost.it/scienza/feed/",
+    "https://www.ilpost.it/tecnologia/feed/",
+    "https://www.ilpost.it/sport/feed/",
+]  # i feed che non esistono o sono vuoti vengono semplicemente saltati
 
 # Quali notizie
 POOL_MAX = 60        # notizie del giorno tra cui scegliere le più importanti
@@ -37,6 +43,7 @@ MAX_PAGINE_FEED = 4  # quante pagine di ogni feed leggere per risalire fino a in
 # Struttura della puntata
 N_APPROFONDIMENTI = 8        # notizie raccontate in modo disteso
 PAROLE_APPROFONDIMENTO = 200  # parole minime per ciascuna
+N_PUNTI_ELENCO = 8        # titoli mostrati come elenco puntato nella descrizione dell'episodio
 N_BREVI = 16                 # notizie nella rassegna "in breve"
 PAROLE_BREVE = 80            # parole minime per ciascuna
 # Durata indicativa: (8x200 + 16x80 + 150) parole = circa 3000 parole = 17-19 minuti
@@ -47,7 +54,7 @@ MAX_CARATTERI_BREVI = 1800   # idem per le notizie brevi
 
 # Voce
 USA_GEMINI_TTS = True        # se False usa sempre Isabella
-VOCE_GEMINI = "Aoede"         # altre: Zephyr, Puck, Charon, Fenrir, Leda, Orus, Kore
+VOCE_GEMINI = "Aoede"         # altre: Zephyr, Puck, Charon, Fenrir, Leda, Orus, Aoede
 MODELLI_TTS = [
     "gemini-3.8-flash-tts",
     "gemini-3.8-flash-lite-tts",
@@ -78,6 +85,12 @@ GIORNI = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato",
 MESI = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio",
         "agosto", "settembre", "ottobre", "novembre", "dicembre"]
 # --------------------------------------------------
+
+
+def crea_client():
+    # La libreria 3.x usa di default l'API stabile "v1", che non accetta la voce:
+    # per questo forzo "v1beta". La chiave è letta da GEMINI_API_KEY.
+    return genai.Client(http_options=types.HttpOptions(api_version="v1beta"))
 
 
 def pulisci(testo):
@@ -111,6 +124,7 @@ def data_voce(voce, fuso):
 def leggi_feed(url, giorno_minimo, fuso):
     """Legge un feed pagina per pagina, finché arriva a notizie più vecchie di giorno_minimo."""
     voci, link_visti = [], set()
+    pagine = 0
     for pagina in range(1, MAX_PAGINE_FEED + 1):
         indirizzo = url if pagina == 1 else f"{url}?paged={pagina}"
         try:
@@ -121,6 +135,7 @@ def leggi_feed(url, giorno_minimo, fuso):
         nuove = [v for v in feed.entries if v.get("link") and v.get("link") not in link_visti]
         if not nuove:
             break  # pagina vuota, oppure il sito ignora la paginazione
+        pagine += 1
         for v in nuove:
             link_visti.add(v.get("link"))
             voci.append(v)
@@ -128,6 +143,7 @@ def leggi_feed(url, giorno_minimo, fuso):
         date = [d for d in date if d]
         if date and min(date) < giorno_minimo:
             break  # siamo già arrivati a notizie dei giorni scorsi
+    print(f"Feed {url}: {len(voci)} articoli letti in {pagine} pagine")
     return voci
 
 
@@ -336,9 +352,9 @@ def audio_gemini(testo, percorso_mp3):
     """Voce Gemini. Solleva un errore se qualcosa non va, così si passa a Isabella."""
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg non installato")
-    client = genai.Client()
+    client = crea_client()
     pezzi = dividi_testo(testo, MAX_CARATTERI_TTS)
-    print(f"Voce Gemini: {len(pezzi)} pezzi di testo")
+    print(f"Voce Gemini: {VOCE_GEMINI}, {len(pezzi)} pezzi di testo")
     pcm = bytearray()
     modelli_ok = list(MODELLI_TTS)  # modelli ancora utilizzabili, il primo è quello in uso
     for numero, pezzo in enumerate(pezzi, 1):
@@ -354,7 +370,7 @@ def audio_gemini(testo, percorso_mp3):
                     messaggio = str(e)
                     print(f"TTS {modello}, pezzo {numero}, tentativo {tentativo}: {messaggio[:300]}")
                     # modello inesistente o quota giornaliera finita: inutile riprovare
-                    if "404" in messaggio or "PerDay" in messaggio:
+                    if "404" in messaggio or "PerDay" in messaggio or "INVALID_ARGUMENT" in messaggio:
                         break
                     if tentativo < TENTATIVI_TTS:
                         time.sleep(30 * tentativo)
@@ -424,6 +440,7 @@ def recupera_archivio(cartella, nome_file_oggi):
             "titolo": voce.get("title", nome),
             "descrizione": voce.get("summary", ""),
             "data": voce.get("published", formatdate()),
+            "guid": voce.get("id", nome),
             "nome": nome,
             "url": url,
         })
@@ -457,7 +474,7 @@ def scrivi_feed(cartella, episodi, copertina):
       <title>{escape(ep["titolo"])}</title>
       <description>{escape(ep["descrizione"])}</description>
       <pubDate>{ep["data"]}</pubDate>
-      <guid isPermaLink="false">{escape(ep["nome"])}</guid>
+      <guid isPermaLink="false">{escape(ep.get("guid", ep["nome"]))}</guid>
       <enclosure url="{BASE_URL}/{ep["nome"]}" length="{dimensione}" type="audio/mpeg"/>
     </item>
 """
@@ -473,67 +490,4 @@ def scrivi_feed(cartella, episodi, copertina):
 {immagine}{voci}  </channel>
 </rss>
 """
-    with open(os.path.join(cartella, "feed.xml"), "w", encoding="utf-8") as f:
-        f.write(xml)
-
-
-def scrivi_pagina(cartella, episodi):
-    righe = "".join(
-        f'<h3>{escape(ep["titolo"])}</h3>\n'
-        f'<audio controls preload="none" src="{ep["nome"]}" style="width:100%"></audio>\n'
-        for ep in episodi
-    )
-    pagina = f"""<!doctype html>
-<html lang="it"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Notizie del mattino</title></head>
-<body style="font-family:sans-serif;max-width:600px;margin:2rem auto;padding:0 1rem">
-<h1>Notizie del mattino</h1>
-{righe}<p>Feed podcast: <code>{BASE_URL}/feed.xml</code></p>
-</body></html>
-"""
-    with open(os.path.join(cartella, "index.html"), "w", encoding="utf-8") as f:
-        f.write(pagina)
-
-
-def main():
-    adesso = datetime.now(ZoneInfo("Europe/Rome"))
-    data_parlata = f"{GIORNI[adesso.weekday()]} {adesso.day} {MESI[adesso.month - 1]} {adesso.year}"
-    sigla_data = adesso.strftime("%Y-%m-%d")
-    nome_file = f"notizie-{sigla_data}.mp3"
-    titolo = f"Notizie di {data_parlata}"
-
-    client = genai.Client()  # legge la chiave da GEMINI_API_KEY
-    notizie = prendi_notizie(client, adesso.date(), adesso.tzinfo)
-    testo = scrivi_testo(client, notizie, data_parlata)
-    parole = len(testo.split())
-    print(f"Testo totale: {parole} parole (circa {parole / 155:.1f} minuti)")
-
-    cartella = "site"
-    os.makedirs(cartella, exist_ok=True)
-    crea_audio(testo, os.path.join(cartella, nome_file))
-
-    oggi = {
-        "titolo": titolo,
-        "descrizione": testo[:300] + "...",
-        "data": formatdate(adesso.timestamp(), usegmt=True),
-        "nome": nome_file,
-    }
-    episodi = [oggi] + recupera_archivio(cartella, nome_file)
-
-    copertina = None
-    for nome in COPERTINE:
-        if os.path.exists(nome):
-            shutil.copy(nome, os.path.join(cartella, nome))
-            copertina = nome
-            break
-    if not copertina:
-        print("Nessuna copertina trovata (cover.png o cover.jpg nella radice del repo).")
-
-    scrivi_feed(cartella, episodi, copertina)
-    scrivi_pagina(cartella, episodi)
-    print(f"Fatto: {nome_file} ({len(episodi)} episodi nel feed)")
-
-
-if __name__ == "__main__":
-    main()
+    with open(os.path.join(cartella, "feed.xml"), "w", encoding="utf-8")
