@@ -2,7 +2,7 @@ name: Podcast mattutino
 
 on:
   schedule:
-    - cron: "30 4 * * *"   # 04:30 UTC = 05:30 inverno / 06:30 estate in Italia
+    - cron: "0 20 * * *"   # 20:00 UTC = 21:00 inverno / 22:00 estate in Italia
   workflow_dispatch:        # permette di avviarlo a mano
 
 permissions:
@@ -28,12 +28,20 @@ jobs:
           python-version: "3.12"
 
       - name: Installa dipendenze
-        run: pip install -U feedparser edge-tts anthropic
+        run: pip install -U feedparser edge-tts "google-genai<3" trafilatura
+
+      - name: Installa ffmpeg
+        run: |
+          if ! command -v ffmpeg > /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version | head -n 1
 
       - name: Genera il podcast
         run: python podcast.py
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
       - uses: actions/configure-pages@v5
 
