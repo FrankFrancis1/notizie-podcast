@@ -490,4 +490,75 @@ def scrivi_feed(cartella, episodi, copertina):
 {immagine}{voci}  </channel>
 </rss>
 """
-    with open(os.path.join(cartella, "feed.xml"), "w", encoding="utf-8")
+    with open(os.path.join(cartella, "feed.xml"), "w", encoding="utf-8") as f:
+        f.write(xml)
+
+
+def scrivi_pagina(cartella, episodi):
+    righe = "".join(
+        f'<h3>{escape(ep["titolo"])}</h3>\n'
+        f'<audio controls preload="none" src="{ep["nome"]}" style="width:100%"></audio>\n'
+        for ep in episodi
+    )
+    pagina = f"""<!doctype html>
+<html lang="it"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notizie del mattino</title></head>
+<body style="font-family:sans-serif;max-width:600px;margin:2rem auto;padding:0 1rem">
+<h1>Notizie del mattino</h1>
+{righe}<p>Feed podcast: <code>{BASE_URL}/feed.xml</code></p>
+</body></html>
+"""
+    with open(os.path.join(cartella, "index.html"), "w", encoding="utf-8") as f:
+        f.write(pagina)
+
+
+def descrizione_episodio(notizie):
+    """Elenco puntato dei temi principali, mostrato nella descrizione dell'episodio."""
+    voci = "".join(f"<li>{escape(n['titolo'])}</li>" for n in notizie[:N_PUNTI_ELENCO])
+    return f"<p>Le notizie principali:</p><ul>{voci}</ul>"
+
+
+def main():
+    adesso = datetime.now(ZoneInfo("Europe/Rome"))
+    data_parlata = f"{GIORNI[adesso.weekday()]} {adesso.day} {MESI[adesso.month - 1]} {adesso.year}"
+    sigla_data = adesso.strftime("%Y-%m-%d")
+    nome_file = f"notizie-{sigla_data}.mp3"
+    titolo = f"Notizie di {data_parlata}"
+
+    client = crea_client()
+    notizie = prendi_notizie(client, adesso.date(), adesso.tzinfo)
+    testo = scrivi_testo(client, notizie, data_parlata)
+    parole = len(testo.split())
+    print(f"Testo totale: {parole} parole (circa {parole / 155:.1f} minuti)")
+
+    cartella = "site"
+    os.makedirs(cartella, exist_ok=True)
+    crea_audio(testo, os.path.join(cartella, nome_file))
+
+    oggi = {
+        "titolo": titolo,
+        "descrizione": descrizione_episodio(notizie),
+        "data": formatdate(adesso.timestamp(), usegmt=True),
+        "nome": nome_file,
+        # include l'ora: se rilanci il workflow lo stesso giorno, l'app vede un episodio nuovo
+        "guid": f"{nome_file}-{adesso.strftime('%H%M')}",
+    }
+    episodi = [oggi] + recupera_archivio(cartella, nome_file)
+
+    copertina = None
+    for nome in COPERTINE:
+        if os.path.exists(nome):
+            shutil.copy(nome, os.path.join(cartella, nome))
+            copertina = nome
+            break
+    if not copertina:
+        print("Nessuna copertina trovata (cover.png o cover.jpg nella radice del repo).")
+
+    scrivi_feed(cartella, episodi, copertina)
+    scrivi_pagina(cartella, episodi)
+    print(f"Fatto: {nome_file} ({len(episodi)} episodi nel feed)")
+
+
+if __name__ == "__main__":
+    main()
