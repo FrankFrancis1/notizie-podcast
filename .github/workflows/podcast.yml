@@ -2,7 +2,7 @@ name: Podcast mattutino
 
 on:
   schedule:
-    - cron: "0 20 * * *"   # 20:00 UTC = 21:00 inverno / 22:00 estate in Italia
+    - cron: "0 21 * * *"   # 21:00 UTC = 22:00 inverno / 23:00 estate in Italia
   workflow_dispatch:        # permette di avviarlo a mano
 
 permissions:
@@ -28,7 +28,7 @@ jobs:
           python-version: "3.12"
 
       - name: Installa dipendenze
-        run: pip install -U feedparser edge-tts "google-genai<3" trafilatura
+        run: pip install -U feedparser edge-tts "google-genai>=2.25,<3" trafilatura
 
       - name: Installa ffmpeg
         run: |
@@ -42,6 +42,8 @@ jobs:
         run: python podcast.py
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
 
       - uses: actions/configure-pages@v5
 
