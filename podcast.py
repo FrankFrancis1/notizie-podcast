@@ -1,13 +1,17 @@
 import asyncio
+import base64
 import html
+import json
 import os
 import re
 import shutil
+import smtplib
 import subprocess
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from email.utils import formatdate
 from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo
@@ -40,13 +44,13 @@ POOL_MAX = 60        # notizie del giorno tra cui scegliere le più importanti
 MIN_NOTIZIE = 10     # se oggi ce ne sono meno, aggiungo quelle del giorno prima
 MAX_PAGINE_FEED = 4  # quante pagine di ogni feed leggere per risalire fino a inizio giornata
 
-# Struttura della puntata
-N_APPROFONDIMENTI = 8        # notizie raccontate in modo disteso
-PAROLE_APPROFONDIMENTO = 200  # parole minime per ciascuna
-N_PUNTI_ELENCO = 8        # titoli mostrati come elenco puntato nella descrizione dell'episodio
-N_BREVI = 16                 # notizie nella rassegna "in breve"
-PAROLE_BREVE = 80            # parole minime per ciascuna
-# Durata indicativa: (8x200 + 16x80 + 150) parole = circa 3000 parole = 17-19 minuti
+# Struttura della puntata (circa 10 minuti)
+N_APPROFONDIMENTI = 5         # notizie raccontate in modo disteso
+PAROLE_APPROFONDIMENTO = 170  # parole indicative per ciascuna
+N_PUNTI_ELENCO = 5            # titoli mostrati come elenco puntato nella descrizione dell'episodio
+N_BREVI = 8                   # notizie nella rassegna "in breve"
+PAROLE_BREVE = 65             # parole indicative per ciascuna
+# Durata indicativa: (5x170 + 8x65 + 100) = circa 1500 parole = 9-10 minuti di audio.
 # Per accorciare o allungare, cambia questi quattro numeri.
 
 MAX_CARATTERI_APPROF = 4000  # testo articolo passato a Gemini (approfondimenti)
@@ -60,10 +64,16 @@ MODELLI_TTS = [
     "gemini-3.8-flash-lite-tts",
     "gemini-2.5-flash-preview-tts",
 ]
-# Lasciare vuoto: i modelli vocali leggono ad alta voce anche le istruzioni scritte nel testo.
-ISTRUZIONE_VOCE = ""
+# Voce: un nome della lista di 30 voci (es. "Aoede", "Charon", "Sulafat") oppure un ID personale
+# "voice_..." creato con Voice design in Google AI Studio (vedi spiegazione).
+# Stile: frase breve che NON viene letta (es. "calda e chiara, da conduttore radiofonico").
+# Lasciare vuoto per la voce naturale: la documentazione consiglia di provare prima senza stile.
+STILE_VOCE = ""
 MAX_CARATTERI_TTS = 5000     # dimensione di ogni pezzo inviato alla voce (meno pezzi = meno richieste)
 TENTATIVI_TTS = 3
+
+# Email con il recap scritto. Servono i due "secrets" GMAIL_USER e GMAIL_APP_PASSWORD nel repo.
+EMAIL_DESTINATARIO = "francescorosa.business@gmail.com"
 
 VOCE_EDGE = "it-IT-IsabellaNeural"  # voce di riserva; maschile: it-IT-DiegoNeural
 VELOCITA_EDGE = "+5%"
@@ -90,7 +100,7 @@ MESI = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio",
 def crea_client():
     # La libreria 3.x usa di default l'API stabile "v1", che non accetta la voce:
     # per questo forzo "v1beta". La chiave è letta da GEMINI_API_KEY.
-    return genai.Client(http_options=types.HttpOptions(api_version="v1beta"))
+    return genai.Client(http_options=types.HttpOptions(api_version="v1beta", timeout=300_000))
 
 
 def pulisci(testo):
@@ -129,9 +139,14 @@ def leggi_feed(url, giorno_minimo, fuso):
         indirizzo = url if pagina == 1 else f"{url}?paged={pagina}"
         try:
             feed = feedparser.parse(indirizzo)
+            if not feed.entries and pagina == 1:
+                time.sleep(5)
+                feed = feedparser.parse(indirizzo)  # secondo tentativo
         except Exception as e:
             print(f"Feed non leggibile {indirizzo}: {e}")
             break
+        if not feed.entries and pagina == 1:
+            print(f"Feed vuoto {indirizzo}: stato {feed.get('status')}, errore {feed.get('bozo_exception')}")
         nuove = [v for v in feed.entries if v.get("link") and v.get("link") not in link_visti]
         if not nuove:
             break  # pagina vuota, oppure il sito ignora la paginazione
@@ -234,11 +249,12 @@ def formatta(notizie, massimo):
     return "\n\n".join(blocchi)
 
 
-def chiedi_gemini(client, prompt):
+def chiedi_gemini(client, prompt, json_out=False):
     for modello in MODELLI:
         for tentativo in range(1, TENTATIVI + 1):
             try:
-                risposta = client.models.generate_content(model=modello, contents=prompt)
+                config = types.GenerateContentConfig(response_mime_type="application/json") if json_out else None
+                risposta = client.models.generate_content(model=modello, contents=prompt, config=config)
                 testo = (risposta.text or "").strip()
                 if testo:
                     print(f"Modello usato: {modello} (tentativo {tentativo})")
@@ -261,7 +277,7 @@ REGOLE_COMUNI = (
     "- Solo testo da leggere ad alta voce: niente elenchi, numeri di punto, titoli, "
     "markdown, emoji, parentesi o URL.\n"
     "- Scrivi per esteso numeri, sigle e simboli difficili da pronunciare.\n"
-    "- Rispetta le lunghezze minime richieste: sono importanti.\n"
+    "- Rispetta le lunghezze indicate (non superarle di molto): sono importanti.\n"
 )
 
 
@@ -278,7 +294,8 @@ def scrivi_testo(client, notizie, data_parlata):
         f"una panoramica dei titoli del giorno "
         f"(3 o 4 frasi); poi un approfondimento per OGNUNA delle {len(approfondimenti)} "
         f"notizie qui sotto, nell'ordine dato. Ogni approfondimento deve essere un "
-        f"racconto disteso di almeno {PAROLE_APPROFONDIMENTO} parole: cosa è successo, "
+        f"racconto di circa {PAROLE_APPROFONDIMENTO} parole (mai più di "
+        f"{int(PAROLE_APPROFONDIMENTO * 1.25)}): cosa è successo, "
         f"dove, chi è coinvolto, contesto, perché conta. "
         f"Non chiudere la puntata e non salutare alla fine: seguirà una seconda parte.\n\n"
         f"{REGOLE_COMUNI}\nNOTIZIE:\n\n{formatta(approfondimenti, MAX_CARATTERI_APPROF)}"
@@ -297,8 +314,9 @@ def scrivi_testo(client, notizie, data_parlata):
             f"ULTIMA PARTE della puntata, che comincia dopo gli approfondimenti.\n\n"
             f"Apri con una breve frase di passaggio (per esempio che passiamo alle altre "
             f"notizie del giorno), senza salutare di nuovo. Poi la rassegna \"in breve\": "
-            f"per OGNUNA delle {len(brevi)} notizie qui sotto scrivi un paragrafo di almeno "
-            f"{PAROLE_BREVE} parole, non una sola frase: cosa è successo, dove, chi è "
+            f"per OGNUNA delle {len(brevi)} notizie qui sotto scrivi un paragrafo di circa "
+            f"{PAROLE_BREVE} parole (mai più di {int(PAROLE_BREVE * 1.25)}), di almeno due frasi: "
+            f"cosa è successo, dove, chi è "
             f"coinvolto, e il contesto presente nel testo. Puoi raggruppare per tema "
             f"(Italia, mondo, economia, cultura...) con frasi di transizione. "
             f"Chiudi con un congedo breve.\n\n"
@@ -306,8 +324,11 @@ def scrivi_testo(client, notizie, data_parlata):
         )
         parte_b = chiedi_gemini(client, prompt_b)
         print(f"Seconda parte: {len(parte_b.split())} parole")
+    if not brevi:
+        print("Tutte le notizie disponibili sono negli approfondimenti: niente rassegna in breve.")
     if len(parte_b) < 300:
-        print("Seconda parte non disponibile, chiudo la puntata con un congedo.")
+        if brevi:
+            print("Seconda parte non disponibile, chiudo la puntata con un congedo.")
         parte_b = "Per questa rassegna è tutto. Buona giornata, e al prossimo notiziario."
 
     return f"{parte_a}\n\n{parte_b}"
@@ -329,10 +350,29 @@ def dividi_testo(testo, massimo):
     return pezzi
 
 
-def sintetizza(client, modello, testo):
+def sintetizza_nuovo(client, modello, testo):
+    """Modelli Gemini 3.8 TTS: usano la Interactions API; la voce va in generation_config.speech_config."""
+    blocco = {"type": "text", "text": testo}
+    if STILE_VOCE:
+        blocco["annotations"] = [{"type": "speech_metadata", "style": STILE_VOCE}]
+    risposta = client.interactions.create(
+        model=modello,
+        input=[{"type": "user_input", "content": [blocco]}],
+        # PCM grezzo a 24 kHz: si possono incollare i pezzi uno dopo l'altro
+        response_format={"type": "audio", "mime_type": "audio/l16", "sample_rate": 24000},
+        generation_config={"speech_config": [{"voice": VOCE_GEMINI}]},
+    )
+    dati = base64.b64decode(risposta.output_audio.data)
+    if not dati:
+        raise RuntimeError("audio vuoto")
+    return dati
+
+
+def sintetizza_vecchio(client, modello, testo):
+    """Modelli TTS precedenti (2.5 / 3.1): vecchia interfaccia generate_content."""
     risposta = client.models.generate_content(
         model=modello,
-        contents=f"{ISTRUZIONE_VOCE}\n\n{testo}" if ISTRUZIONE_VOCE else testo,
+        contents=testo,
         config=types.GenerateContentConfig(
             response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
@@ -346,6 +386,12 @@ def sintetizza(client, modello, testo):
     if not dati:
         raise RuntimeError("audio vuoto")
     return dati
+
+
+def sintetizza(client, modello, testo):
+    if modello.startswith("gemini-3.8"):
+        return sintetizza_nuovo(client, modello, testo)
+    return sintetizza_vecchio(client, modello, testo)
 
 
 def audio_gemini(testo, percorso_mp3):
@@ -513,6 +559,80 @@ def scrivi_pagina(cartella, episodi):
         f.write(pagina)
 
 
+# ---------- EMAIL ----------
+
+def leggi_json(testo):
+    testo = re.sub(r"^```(?:json)?|```$", "", testo.strip(), flags=re.MULTILINE).strip()
+    return json.loads(testo)
+
+
+def scrivi_recap(client, notizie):
+    """Un riassunto scritto per ogni notizia: più lungo per gli approfondimenti, breve per le altre."""
+    blocchi = []
+    for i, n in enumerate(notizie, 1):
+        limite = 1500 if i <= N_APPROFONDIMENTI else 600
+        corpo = n["completo"][:limite] if n.get("completo") else n["riassunto"]
+        blocchi.append(f"{i}. {n['titolo']}.\n{corpo}")
+    prompt = (
+        "Scrivi il recap scritto (per una email) di un notiziario italiano. Per ciascuna delle "
+        f"{len(notizie)} notizie numerate qui sotto scrivi un riassunto in italiano: "
+        f"per le prime {min(N_APPROFONDIMENTI, len(notizie))} di 3 o 4 frasi (circa 60 parole), "
+        "per le altre di 1 o 2 frasi (circa 30 parole). Stile chiaro e neutro; usa solo le "
+        "informazioni fornite, senza inventare fatti, numeri o citazioni.\n"
+        'Rispondi SOLO con un array JSON, per esempio [{"n": 1, "testo": "..."}, '
+        '{"n": 2, "testo": "..."}], con un oggetto per ogni notizia.\n\n'
+        + "\n\n".join(blocchi)
+    )
+    riassunti = {}
+    try:
+        risposta = chiedi_gemini(client, prompt, json_out=True)
+        for voce in leggi_json(risposta):
+            riassunti[int(voce["n"])] = str(voce["testo"]).strip()
+    except Exception as e:
+        print(f"Recap con Gemini non riuscito ({e}): uso gli estratti degli articoli.")
+    # per le notizie senza riassunto uso l'estratto del feed
+    return [riassunti.get(i) or n["riassunto"][:300] for i, n in enumerate(notizie, 1)]
+
+
+def invia_email(titolo, notizie, riassunti, utente, password):
+    principali = list(zip(notizie, riassunti))[:N_APPROFONDIMENTI]
+    brevi = list(zip(notizie, riassunti))[N_APPROFONDIMENTI:]
+    link_ascolto = f"{BASE_URL}/"
+
+    testo = [titolo, f"Ascolta l'episodio: {link_ascolto}", "", "LE NOTIZIE PRINCIPALI", ""]
+    html_righe = [
+        f"<h2>{escape(titolo)}</h2>",
+        f'<p><a href="{link_ascolto}">Ascolta l\'episodio</a></p>',
+        "<h3>Le notizie principali</h3>",
+    ]
+    for n, r in principali:
+        testo += [n["titolo"], r, n["link"] or "", ""]
+        html_righe.append(
+            f'<p><b><a href="{escape(n["link"] or "")}">{escape(n["titolo"])}</a></b><br>{escape(r)}</p>'
+        )
+    if brevi:
+        testo += ["IN BREVE", ""]
+        html_righe.append("<h3>In breve</h3>")
+        for n, r in brevi:
+            testo += [f"- {n['titolo']}: {r}", n["link"] or "", ""]
+            html_righe.append(
+                f'<p><a href="{escape(n["link"] or "")}">{escape(n["titolo"])}</a> &ndash; {escape(r)}</p>'
+            )
+    html_righe.append("<p><small>Riassunto generato automaticamente: può contenere imprecisioni.</small></p>")
+
+    messaggio = EmailMessage()
+    messaggio["Subject"] = titolo
+    messaggio["From"] = utente
+    messaggio["To"] = EMAIL_DESTINATARIO
+    messaggio.set_content("\n".join(testo))
+    messaggio.add_alternative("\n".join(html_righe), subtype="html")
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=60) as server:
+        server.login(utente, password)
+        server.send_message(messaggio)
+    print(f"Email inviata a {EMAIL_DESTINATARIO}")
+
+
 def descrizione_episodio(notizie):
     """Elenco puntato dei temi principali, mostrato nella descrizione dell'episodio."""
     voci = "".join(f"<li>{escape(n['titolo'])}</li>" for n in notizie[:N_PUNTI_ELENCO])
@@ -558,6 +678,18 @@ def main():
     scrivi_feed(cartella, episodi, copertina)
     scrivi_pagina(cartella, episodi)
     print(f"Fatto: {nome_file} ({len(episodi)} episodi nel feed)")
+
+    # recap scritto via email (un eventuale errore qui non blocca la pubblicazione)
+    utente = os.environ.get("GMAIL_USER", "").strip()
+    password = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")
+    if not utente or not password:
+        print("Email non configurata (mancano GMAIL_USER e GMAIL_APP_PASSWORD): salto l'invio.")
+        return
+    try:
+        riassunti = scrivi_recap(client, notizie)
+        invia_email(titolo, notizie, riassunti, utente, password)
+    except Exception as e:
+        print(f"Email non inviata: {e}")
 
 
 if __name__ == "__main__":
